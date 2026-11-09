@@ -1,0 +1,29 @@
+# Throwaway BLA 237 test of PR-Agent's comment filter; reverted in the next commit.
+name: bla237-filter-test
+on:
+  pull_request:
+permissions: {}
+jobs:
+  filter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include: >-
+          ${{ fromJSON('[{"body": "/review", "want": true}, {"body": "/review -i", "want": true}, {"body": "/review\nplease", "want": true}, {"body": "/review\r\nplease", "want": true}, {"body": "/improve", "want": true}, {"body": "/ask what changed?", "want": true}, {"body": "/reviewer", "want": false}, {"body": "/asking", "want": false}, {"body": "/describe", "want": false}, {"body": "x /review", "want": false}, {"body": "/review\tnow", "want": true}]') }}
+    steps:
+      - name: Evaluate the template's filter
+        id: f
+        if: ((startsWith(format('{0} ', matrix.body), '/review ') || startsWith(matrix.body, fromJSON('"/review\n"')) || startsWith(matrix.body, fromJSON('"/review\r"')) || startsWith(matrix.body, fromJSON('"/review\t"'))) ||
+         (startsWith(format('{0} ', matrix.body), '/improve ') || startsWith(matrix.body, fromJSON('"/improve\n"')) || startsWith(matrix.body, fromJSON('"/improve\r"')) || startsWith(matrix.body, fromJSON('"/improve\t"'))) ||
+         (startsWith(format('{0} ', matrix.body), '/ask ') || startsWith(matrix.body, fromJSON('"/ask\n"')) || startsWith(matrix.body, fromJSON('"/ask\r"')) || startsWith(matrix.body, fromJSON('"/ask\t"'))))
+        run: echo "matched=true" >> "$GITHUB_OUTPUT"
+      - name: Compare with the expected result
+        env:
+          WANT: ${{ matrix.want }}
+          GOT: ${{ steps.f.outputs.matched == 'true' }}
+          BODY: ${{ toJSON(matrix.body) }}
+        run: |
+          echo "body=$BODY want=$WANT got=$GOT"
+          [ "$WANT" = "$GOT" ]
