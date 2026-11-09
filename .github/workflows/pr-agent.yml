@@ -17,7 +17,7 @@ jobs:
   pr_agent:
     name: pr-agent
     # Same-repository PRs only (fork PRs get no secrets). On comments, only /review, /improve
-    # and /ask on a PR, from owners, members and collaborators; /describe is not allowed.
+    # and /ask on a PR (not /reviewer), from owners, members and collaborators; /describe is not allowed.
     # Never a bot (no feedback loops).
     if: >-
       github.event.sender.type != 'Bot' &&
@@ -25,9 +25,9 @@ jobs:
         github.event.pull_request.head.repo.full_name == github.repository) ||
        (github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
-        (startsWith(github.event.comment.body, '/review') ||
-         startsWith(github.event.comment.body, '/improve') ||
-         startsWith(github.event.comment.body, '/ask')) &&
+        ((startsWith(format('{0} ', github.event.comment.body), '/review ') || startsWith(github.event.comment.body, fromJSON('"/review\n"')) || startsWith(github.event.comment.body, fromJSON('"/review\r"')) || startsWith(github.event.comment.body, fromJSON('"/review\t"'))) ||
+         (startsWith(format('{0} ', github.event.comment.body), '/improve ') || startsWith(github.event.comment.body, fromJSON('"/improve\n"')) || startsWith(github.event.comment.body, fromJSON('"/improve\r"')) || startsWith(github.event.comment.body, fromJSON('"/improve\t"'))) ||
+         (startsWith(format('{0} ', github.event.comment.body), '/ask ') || startsWith(github.event.comment.body, fromJSON('"/ask\n"')) || startsWith(github.event.comment.body, fromJSON('"/ask\r"')) || startsWith(github.event.comment.body, fromJSON('"/ask\t"')))) &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
     # The action is a Docker image. The Studio Linux VM runners have Docker, but their runner
     # accounts are not in the docker group, so this runs on GitHub-hosted Linux.
@@ -77,8 +77,8 @@ jobs:
           # .pr_agent.toml (default branch) is applied after this and can override it.
           config.extra_config_url: /github/workspace/.pr-agent-shared/pr_agent.toml
       - name: Scorecard
-        # Runs when PR-Agent fails too, so a failed review replaces the old scorecard with
-        # key_issues=-1 instead of leaving an earlier verdict in place.
+        # Runs when PR-Agent or the settings fetch fails too, so a failed review replaces the old
+        # scorecard with key_issues=-1 instead of leaving an earlier verdict in place.
         if: ${{ !cancelled() && steps.gate.outputs.ready == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,4 +86,29 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           REVIEW_OUTCOME: ${{ steps.pragent.outcome }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 -I .pr-agent-shared/scorecard.py
+        run: |
+          if [ -f .pr-agent-shared/scorecard.py ]; then
+            exec python3 -I .pr-agent-shared/scorecard.py
+          fi
+          # The shared settings could not be fetched: post a failed scorecard, and fail the step.
+          python3 -I - <<'PY'
+          import json, os, subprocess
+          def gh(*args, data=None):
+              return subprocess.run(["gh", "api", *args], input=data, capture_output=True, text=True, check=True).stdout
+          repo, pr = os.environ["REPO"], os.environ["PR_NUMBER"]
+          head = (os.environ.get("HEAD_SHA") or json.loads(gh(f"repos/{repo}/pulls/{pr}"))["head"]["sha"])[:7]
+          pages = json.loads(gh("--paginate", "--slurp", f"repos/{repo}/issues/{pr}/comments"))
+          mine = [c for page in pages for c in page
+                  if c["user"]["login"] == "github-actions[bot]" and c["body"].startswith("<!-- pr-agent:scorecard -->")]
+          body = ("<!-- pr-agent:scorecard -->\n"
+                  f"<!-- key_issues=-1 overall=0 status=failed head={head} -->\n"
+                  "## PR-Agent scorecard\n\n"
+                  f"**⛔ Review failed on {head}.** The shared settings couldn't be loaded from "
+                  "blazeluminati/pr-agent-settings, so this PR is not scored as clean.\n")
+          payload = json.dumps({"body": body})
+          if mine:
+              gh("-X", "PATCH", f"repos/{repo}/issues/comments/{mine[0]['id']}", "--input", "-", data=payload)
+          else:
+              gh("-X", "POST", f"repos/{repo}/issues/{pr}/comments", "--input", "-", data=payload)
+          PY
+          exit 1
