@@ -32,7 +32,7 @@ jobs:
     # The action is a Docker image. The Studio Linux VM runners have Docker, but their runner
     # accounts are not in the docker group, so this runs on GitHub-hosted Linux.
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     # Job-level, so a comment the filter rejects (job skipped) never joins a group. Pushes and an
     # exact /review share the PR's review group, so a new push cancels the older review; /ask and
     # /improve use their own group, so they can't cancel a running review.
@@ -89,9 +89,11 @@ jobs:
         id: pragent
         if: steps.gate.outputs.ready == 'true'
         # A failed first pass doesn't end the job: the check below decides on a second pass, and
-        # the last step fails the job if neither pass succeeded. The step timeout leaves time for it.
+        # the last step fails the job if no review was scored. About three sequential model calls
+        # (review, suggestions, their self-review), each under the shared ai_timeout of 240 s;
+        # the cap leaves the second pass and the scorecard inside the job's 25 minutes.
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 14
         # Image pinned by digest; the action wrapper only adds a FROM on the rolling
         # :github_action tag, so pinning its commit would not pin what runs.
         # Digest attestation verified with: gh attestation verify --repo The-PR-Agent/pr-agent
@@ -110,51 +112,79 @@ jobs:
           PR_CODE_SUGGESTIONS__PUBLISH_FAILURE_COMMENT: ${{ steps.gate.outputs.score == 'true' && 'false' || 'true' }}
       - name: Check the first review
         id: check
-        # The scorecard's own verdict, printed and not posted (DRY_RUN): anything but a fresh,
-        # complete, readable review of the head (a failed step, an empty or unparseable answer,
-        # no review for this head) reads status=failed. A rerun can't fix a review clipped for
-        # the token budget, so that one reason doesn't start a second pass.
+        # Decides the second pass. The scorecard's own verdict, printed and not posted (DRY_RUN),
+        # is asked whether this run left a fresh, scorable review of the head, as if the step had
+        # succeeded. No such review (a 400, a 429, a timeout, an empty or unparseable answer, no
+        # update for this head): rerun everything (mode=full). A good review but a failed step:
+        # only the code suggestions failed, so rerun just those and keep the review
+        # (mode=improve). A review clipped for the token budget counts as present, since a
+        # rerun can't fix that; the scorecard still marks it failed.
         if: ${{ !cancelled() && steps.gate.outputs.ready == 'true' && steps.gate.outputs.score == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
-          REVIEW_OUTCOME: ${{ steps.pragent.outcome }}
+          STEP_OUTCOME: ${{ steps.pragent.outcome }}
           HEAD_SHA: ${{ steps.gate.outputs.head }}
           RUN_STARTED: ${{ steps.gate.outputs.started }}
           DRY_RUN: "1"
         run: |
-          second=false
+          mode=none
           reason=""
           if [ ! -f .pr-agent-shared/scorecard.py ]; then
             echo "The shared settings were not fetched; no second pass."
-          elif [ "$REVIEW_OUTCOME" != "success" ]; then
-            # The step failed: a 429, a 400, a timeout, an empty answer. Always retry.
-            second=true
-            reason="The PR-Agent review failed; see the workflow run."
-          elif verdict=$(python3 -I .pr-agent-shared/scorecard.py); then
+          elif verdict=$(REVIEW_OUTCOME=success python3 -I .pr-agent-shared/scorecard.py); then
             printf '%s\n' "$verdict" | sed -n 2p
+            fresh=true
             if printf '%s\n' "$verdict" | sed -n 2p | grep -q 'status=failed'; then
               reason=$(printf '%s\n' "$verdict" | sed -n 's/^\*\*⛔ Not scored on [0-9a-f]*\.\*\* \(.*\) This PR is not scored as clean\.$/\1/p')
               case "$reason" in
-                "PR too large for a full review"*) echo "The review was clipped for the token budget; a rerun can't fix that, so no second pass." ;;
-                *) second=true ;;
+                "PR too large for a full review"*) echo "The review was clipped for the token budget; a rerun can't fix that." ;;
+                *) fresh=false ;;
               esac
             fi
+            if [ "$fresh" = "false" ]; then
+              mode=full
+              if [ "$STEP_OUTCOME" != "success" ]; then
+                reason="The PR-Agent review failed; see the workflow run."
+              fi
+            elif [ "$STEP_OUTCOME" != "success" ]; then
+              mode=improve
+              reason="The code suggestions failed; the review is kept."
+            fi
+          elif [ "$STEP_OUTCOME" != "success" ]; then
+            # The verdict couldn't be read and the step failed: rerun everything.
+            mode=full
+            reason="The PR-Agent review failed; see the workflow run."
           else
             echo "The verdict couldn't be read and the first pass succeeded; no second pass."
           fi
-          if [ "$second" = "true" ]; then
-            echo "::warning title=PR-Agent second pass::The first review failed (${reason:-no reason given}); running the DeepSeek second pass."
+          if [ "$mode" = "full" ]; then
+            echo "::warning title=PR-Agent second pass::The first review failed (${reason:-no reason given}); rerunning the review and code suggestions on DeepSeek."
+          elif [ "$mode" = "improve" ]; then
+            echo "::warning title=PR-Agent second pass::$reason Rerunning only the code suggestions on DeepSeek."
           fi
-          echo "second=$second" >> "$GITHUB_OUTPUT"
-          echo "reason=$(printf '%s' "$reason" | tr -d '\r\n')" >> "$GITHUB_OUTPUT"
+          # What the second pass runs. In full mode, the shared settings' own values.
+          if [ "$mode" = "improve" ]; then
+            auto_review=false
+            push_commands='["/improve"]'
+          else
+            auto_review=$(python3 -I -c 'import tomllib; d = tomllib.load(open(".pr-agent-shared/pr_agent.toml", "rb")).get("github_action_config", {}); print(str(d.get("auto_review", True)).lower())' 2>/dev/null || echo true)
+            push_commands=$(python3 -I -c 'import json, tomllib; d = tomllib.load(open(".pr-agent-shared/pr_agent.toml", "rb")).get("github_action_config", {}); print(json.dumps(d.get("push_commands", ["/review", "/improve"])))' 2>/dev/null || echo '["/review", "/improve"]')
+          fi
+          {
+            echo "mode=$mode"
+            echo "reason=$(printf '%s' "$reason" | tr -d '\r\n')"
+            echo "auto_review=$auto_review"
+            echo "push_commands=$push_commands"
+          } >> "$GITHUB_OUTPUT"
       - name: PR-Agent second pass (DeepSeek, reasoning off)
         id: second
-        if: ${{ !cancelled() && steps.check.outputs.second == 'true' }}
+        if: ${{ !cancelled() && (steps.check.outputs.mode == 'full' || steps.check.outputs.mode == 'improve') }}
         timeout-minutes: 6
         # Same image and key. Env beats the shared settings file (PR-Agent re-applies env after
-        # each file), so only the model and reasoning change; every review rule stays the same.
+        # each file), so only the model, reasoning and (in improve mode) the tools change; every
+        # review rule stays the same.
         uses: docker://pragent/pr-agent@sha256:548e894a88071180832b2f4233f734d0acd0db1a879e2fcbaa70bac8b8372ebe # v0.50.0-github_action (action commit e673a02076ce09a4726c3d0c3cc85780e59ca52b)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -167,23 +197,38 @@ jobs:
           CONFIG__FALLBACK_MODELS: "[]"
           OPENROUTER__REASONING_EFFORT: none
           OPENROUTER__MAX_TOKENS: "32000"
+          # Which tools run: everything in full mode, only /improve in improve mode (opened and
+          # reopened PRs use auto_review/auto_improve, pushes use push_commands).
+          GITHUB_ACTION_CONFIG__AUTO_REVIEW: ${{ steps.check.outputs.auto_review }}
+          GITHUB_ACTION_CONFIG__PUSH_COMMANDS: ${{ steps.check.outputs.push_commands }}
       - name: Scorecard
+        id: scorecard
         # Runs when PR-Agent or the settings fetch fails too, so a failed review replaces the old
         # scorecard with key_issues=-1 instead of leaving an earlier verdict in place. After a
-        # second pass it scores that pass and says so.
+        # second pass it scores the review left standing and says which pass wrote it.
         if: ${{ !cancelled() && steps.gate.outputs.ready == 'true' && steps.gate.outputs.score == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
-          REVIEW_OUTCOME: ${{ steps.check.outputs.second == 'true' && steps.second.outcome || steps.pragent.outcome }}
-          REVIEW_PASS: ${{ steps.check.outputs.second == 'true' && 'second' || 'first' }}
+          # full: the second pass's outcome. improve: the review was already checked as fresh and
+          # scorable, so only the suggestions were rerun. Otherwise the first pass's outcome.
+          REVIEW_OUTCOME: ${{ steps.check.outputs.mode == 'full' && steps.second.outcome || steps.check.outputs.mode == 'improve' && 'success' || steps.pragent.outcome }}
+          REVIEW_PASS: ${{ steps.check.outputs.mode == 'full' && 'second' || steps.check.outputs.mode == 'improve' && 'improve' || 'first' }}
           FIRST_PASS_REASON: ${{ steps.check.outputs.reason }}
           HEAD_SHA: ${{ steps.gate.outputs.head }}
           RUN_STARTED: ${{ steps.gate.outputs.started }}
         run: |
           if [ -f .pr-agent-shared/scorecard.py ]; then
-            exec python3 -I .pr-agent-shared/scorecard.py
+            verdict=$(python3 -I .pr-agent-shared/scorecard.py)
+            printf '%s\n' "$verdict"
+            # scorecard.py prints the hidden line it posted last.
+            if printf '%s\n' "$verdict" | tail -n 1 | grep -q 'status=failed'; then
+              echo "status=failed" >> "$GITHUB_OUTPUT"
+            else
+              echo "status=scored" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
           fi
           # The shared settings could not be fetched: post a failed scorecard, and fail the step.
           python3 -I - <<'PY'
@@ -207,10 +252,18 @@ jobs:
               gh("-X", "POST", f"repos/{repo}/issues/{pr}/comments", "--input", "-", data=payload)
           PY
           exit 1
-      - name: Fail when no pass succeeded
-        # The first pass may fail without failing the job (continue-on-error); the job still
-        # goes red when no PR-Agent pass succeeded, as before the second pass existed.
-        if: ${{ !cancelled() && steps.pragent.outcome == 'failure' && steps.second.outcome != 'success' }}
+      - name: Fail when no review was scored
+        # The first pass may fail without failing the job (continue-on-error). The job goes red
+        # when, after both passes, the scorecard has no scorable review of the head
+        # (status=failed, key_issues=-1), or when no PR-Agent pass succeeded (this also covers
+        # /improve and /ask, which have no scorecard).
+        if: ${{ !cancelled() && steps.gate.outputs.ready == 'true' && (steps.scorecard.outputs.status == 'failed' || (steps.pragent.outcome == 'failure' && steps.second.outcome != 'success')) }}
+        env:
+          SCORECARD: ${{ steps.scorecard.outputs.status }}
         run: |
-          echo "::error title=PR-Agent failed::No PR-Agent pass succeeded; see the steps above."
+          if [ "$SCORECARD" = "failed" ]; then
+            echo "::error title=PR-Agent not scored::No scorable PR-Agent review of this head (scorecard key_issues=-1); see the scorecard comment."
+          else
+            echo "::error title=PR-Agent failed::No PR-Agent pass succeeded; see the steps above."
+          fi
           exit 1
