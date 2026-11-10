@@ -15,8 +15,8 @@ jobs:
     name: pr-agent
     # Same-repository PRs only (fork PRs get no secrets). On comments, only the exact commands
     # /review and /improve (no arguments; a trailing space or newline is allowed) and "/ask <question>"
-    # without PR-Agent options (" --"), on a PR, from owners, members and collaborators. /describe and
-    # arguments are not allowed.
+    # with no "--" anywhere (PR-Agent options), on a PR, from owners, members and collaborators.
+    # /describe and arguments are not allowed.
     # Never a bot (no feedback loops).
     if: >-
       github.event.sender.type != 'Bot' &&
@@ -26,7 +26,7 @@ jobs:
         github.event.issue.pull_request &&
         (contains(fromJSON('["/review","/review ","/review\n","/review\r\n","/review\t"]'), github.event.comment.body) ||
          contains(fromJSON('["/improve","/improve ","/improve\n","/improve\r\n","/improve\t"]'), github.event.comment.body) ||
-         ((startsWith(github.event.comment.body, '/ask ') || startsWith(github.event.comment.body, fromJSON('"/ask\n"')) || startsWith(github.event.comment.body, fromJSON('"/ask\r"')) || startsWith(github.event.comment.body, fromJSON('"/ask\t"'))) && !contains(fromJSON('["/ask ","/ask\n","/ask\r\n","/ask\t"]'), github.event.comment.body) && !contains(github.event.comment.body, ' --') && !contains(github.event.comment.body, fromJSON('"\n--"')))) &&
+         ((startsWith(github.event.comment.body, '/ask ') || startsWith(github.event.comment.body, fromJSON('"/ask\n"')) || startsWith(github.event.comment.body, fromJSON('"/ask\r"')) || startsWith(github.event.comment.body, fromJSON('"/ask\t"'))) && !contains(fromJSON('["/ask ","/ask\n","/ask\r\n","/ask\t"]'), github.event.comment.body) && !contains(github.event.comment.body, '--'))) &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
     # The action is a Docker image. The Studio Linux VM runners have Docker, but their runner
     # accounts are not in the docker group, so this runs on GitHub-hosted Linux.
