@@ -98,6 +98,8 @@ jobs:
           # All review rules: model, limits, triggers, instructions. The repo's own
           # .pr_agent.toml (default branch) is applied after this and can override it.
           config.extra_config_url: /github/workspace/.pr-agent-shared/pr_agent.toml
+          # BLA 237 throwaway: run only /improve on push, so the review is not updated and the scorecard must fail closed.
+          github_action_config.push_commands: '["/improve"]'
       - name: Scorecard
         # Runs when PR-Agent or the settings fetch fails too, so a failed review replaces the old
         # scorecard with key_issues=-1 instead of leaving an earlier verdict in place.
