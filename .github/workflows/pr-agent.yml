@@ -59,6 +59,8 @@ jobs:
             exit 0
           fi
           echo "ready=true" >> "$GITHUB_OUTPUT"
+          # The review must be updated after this moment to count as a review of this run.
+          echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
           # Score only pull_request events and an exact /review comment, against the head
           # captured here, before PR-Agent runs. /improve and /ask never touch the scorecard.
           if [ "$EVENT" = "pull_request" ]; then
@@ -106,6 +108,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           REVIEW_OUTCOME: ${{ steps.pragent.outcome }}
           HEAD_SHA: ${{ steps.gate.outputs.head }}
+          RUN_STARTED: ${{ steps.gate.outputs.started }}
         run: |
           if [ -f .pr-agent-shared/scorecard.py ]; then
             exec python3 -I .pr-agent-shared/scorecard.py
