@@ -1,5 +1,6 @@
 # PR-Agent (https://github.com/The-PR-Agent/pr-agent): AI review and code suggestions on every
-# pull request, drafts included. BLA 237.
+# pull request, drafts included. BLA 237. When the review fails (scored runs only), a second pass
+# reruns it on DeepSeek V4.1 Flash with reasoning off.
 # This file is identical in every repo. The review rules live in the private repo
 # blazeluminati/pr-agent-settings (pr_agent.toml and scorecard.py), read at main on every run.
 # Copy this file to .github/workflows/pr-agent.yml unchanged; edit the rules there, not here.
@@ -87,6 +88,10 @@ jobs:
       - name: PR-Agent
         id: pragent
         if: steps.gate.outputs.ready == 'true'
+        # A failed first pass doesn't end the job: the check below decides on a second pass, and
+        # the last step fails the job if neither pass succeeded. The step timeout leaves time for it.
+        continue-on-error: true
+        timeout-minutes: 10
         # Image pinned by digest; the action wrapper only adds a FROM on the rolling
         # :github_action tag, so pinning its commit would not pin what runs.
         # Digest attestation verified with: gh attestation verify --repo The-PR-Agent/pr-agent
@@ -99,15 +104,73 @@ jobs:
           # All review rules: model, limits, triggers, instructions. The repo's own
           # .pr_agent.toml (default branch) is applied after this and can override it.
           config.extra_config_url: /github/workspace/.pr-agent-shared/pr_agent.toml
-      - name: Scorecard
-        # Runs when PR-Agent or the settings fetch fails too, so a failed review replaces the old
-        # scorecard with key_issues=-1 instead of leaving an earlier verdict in place.
+      - name: Check the first review
+        id: check
+        # The scorecard's own verdict, printed and not posted (DRY_RUN): anything but a fresh,
+        # complete, readable review of the head (a failed step, an empty or unparseable answer,
+        # no review for this head) reads status=failed. A rerun can't fix a review clipped for
+        # the token budget, so that one reason doesn't start a second pass.
         if: ${{ !cancelled() && steps.gate.outputs.ready == 'true' && steps.gate.outputs.score == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           REVIEW_OUTCOME: ${{ steps.pragent.outcome }}
+          HEAD_SHA: ${{ steps.gate.outputs.head }}
+          RUN_STARTED: ${{ steps.gate.outputs.started }}
+          DRY_RUN: "1"
+        run: |
+          second=false
+          reason=""
+          if [ ! -f .pr-agent-shared/scorecard.py ]; then
+            echo "The shared settings were not fetched; no second pass."
+          elif verdict=$(python3 -I .pr-agent-shared/scorecard.py); then
+            printf '%s\n' "$verdict" | sed -n 2p
+            if printf '%s\n' "$verdict" | sed -n 2p | grep -q 'status=failed' &&
+               ! printf '%s\n' "$verdict" | grep -q 'PR too large for a full review'; then
+              second=true
+              reason=$(printf '%s\n' "$verdict" | sed -n 's/^\*\*⛔ Not scored on [0-9a-f]*\.\*\* \(.*\) This PR is not scored as clean\.$/\1/p')
+            fi
+          elif [ "$REVIEW_OUTCOME" != "success" ]; then
+            # The verdict couldn't be read, but the first pass failed: retry.
+            second=true
+            reason="The PR-Agent review failed; see the workflow run."
+          fi
+          if [ "$second" = "true" ]; then
+            echo "::warning title=PR-Agent second pass::The first review failed (${reason:-no reason given}); running the DeepSeek second pass."
+          fi
+          echo "second=$second" >> "$GITHUB_OUTPUT"
+          echo "reason=$(printf '%s' "$reason" | tr -d '\r\n')" >> "$GITHUB_OUTPUT"
+      - name: PR-Agent second pass (DeepSeek, reasoning off)
+        id: second
+        if: ${{ !cancelled() && steps.check.outputs.second == 'true' }}
+        timeout-minutes: 6
+        # Same image and key. Env beats the shared settings file (PR-Agent re-applies env after
+        # each file), so only the model and reasoning change; every review rule stays the same.
+        uses: docker://pragent/pr-agent@sha256:548e894a88071180832b2f4233f734d0acd0db1a879e2fcbaa70bac8b8372ebe # v0.50.0-github_action (action commit e673a02076ce09a4726c3d0c3cc85780e59ca52b)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER__KEY: ${{ secrets.OPENROUTER_KEY }}
+          PYTHONUNBUFFERED: "1"
+          config.extra_config_url: /github/workspace/.pr-agent-shared/pr_agent.toml
+          # DeepSeek V4.1 Flash with reasoning off, as before Flint: it answers in 5-20 seconds.
+          # With reasoning on it spends its whole output cap reasoning and answers nothing.
+          CONFIG__MODEL: openrouter/deepseek/deepseek-v4.1-flash-1017
+          CONFIG__FALLBACK_MODELS: "[]"
+          OPENROUTER__REASONING_EFFORT: none
+          OPENROUTER__MAX_TOKENS: "32000"
+      - name: Scorecard
+        # Runs when PR-Agent or the settings fetch fails too, so a failed review replaces the old
+        # scorecard with key_issues=-1 instead of leaving an earlier verdict in place. After a
+        # second pass it scores that pass and says so.
+        if: ${{ !cancelled() && steps.gate.outputs.ready == 'true' && steps.gate.outputs.score == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          REVIEW_OUTCOME: ${{ steps.check.outputs.second == 'true' && steps.second.outcome || steps.pragent.outcome }}
+          REVIEW_PASS: ${{ steps.check.outputs.second == 'true' && 'second' || 'first' }}
+          FIRST_PASS_REASON: ${{ steps.check.outputs.reason }}
           HEAD_SHA: ${{ steps.gate.outputs.head }}
           RUN_STARTED: ${{ steps.gate.outputs.started }}
         run: |
@@ -135,4 +198,11 @@ jobs:
           else:
               gh("-X", "POST", f"repos/{repo}/issues/{pr}/comments", "--input", "-", data=payload)
           PY
+          exit 1
+      - name: Fail when no pass succeeded
+        # The first pass may fail without failing the job (continue-on-error); the job still
+        # goes red when no PR-Agent pass succeeded, as before the second pass existed.
+        if: ${{ !cancelled() && steps.pragent.outcome == 'failure' && steps.second.outcome != 'success' }}
+        run: |
+          echo "::error title=PR-Agent failed::No PR-Agent pass succeeded; see the steps above."
           exit 1
