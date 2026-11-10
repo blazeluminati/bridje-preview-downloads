@@ -104,6 +104,10 @@ jobs:
           # All review rules: model, limits, triggers, instructions. The repo's own
           # .pr_agent.toml (default branch) is applied after this and can override it.
           config.extra_config_url: /github/workspace/.pr-agent-shared/pr_agent.toml
+          # On scored runs a failure here starts the second pass, so post no "Failed to ..."
+          # comment for it. /improve and /ask keep theirs; a failed second pass still posts.
+          PR_REVIEWER__PUBLISH_REVIEW_FAILURE_COMMENT: ${{ steps.gate.outputs.score == 'true' && 'false' || 'true' }}
+          PR_CODE_SUGGESTIONS__PUBLISH_FAILURE_COMMENT: ${{ steps.gate.outputs.score == 'true' && 'false' || 'true' }}
       - name: Check the first review
         id: check
         # The scorecard's own verdict, printed and not posted (DRY_RUN): anything but a fresh,
