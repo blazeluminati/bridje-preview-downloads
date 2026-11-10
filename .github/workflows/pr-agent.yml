@@ -1,0 +1,138 @@
+# PR-Agent (https://github.com/The-PR-Agent/pr-agent): AI review and code suggestions on every
+# pull request, drafts included. BLA 237.
+# This file is identical in every repo. The review rules live in the private repo
+# blazeluminati/pr-agent-settings (pr_agent.toml and scorecard.py), read at main on every run.
+# Copy this file to .github/workflows/pr-agent.yml unchanged; edit the rules there, not here.
+name: PR-Agent
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
+permissions: {}
+jobs:
+  pr_agent:
+    name: pr-agent
+    # Same-repository PRs only (fork PRs get no secrets). On comments, only the exact commands
+    # /review and /improve (no arguments; a trailing space or newline is allowed) and "/ask <question>"
+    # with no "--" anywhere (PR-Agent options), on a PR, from owners, members and collaborators.
+    # /describe and arguments are not allowed.
+    # Never a bot (no feedback loops).
+    if: >-
+      github.event.sender.type != 'Bot' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+       (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        (contains(fromJSON('["/review","/review ","/review\n","/review\r\n","/review\t"]'), github.event.comment.body) ||
+         contains(fromJSON('["/improve","/improve ","/improve\n","/improve\r\n","/improve\t"]'), github.event.comment.body) ||
+         ((startsWith(github.event.comment.body, '/ask ') || startsWith(github.event.comment.body, fromJSON('"/ask\n"')) || startsWith(github.event.comment.body, fromJSON('"/ask\r"')) || startsWith(github.event.comment.body, fromJSON('"/ask\t"'))) && !contains(fromJSON('["/ask ","/ask\n","/ask\r\n","/ask\t"]'), github.event.comment.body) && !contains(github.event.comment.body, '--'))) &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+    # The action is a Docker image. The Studio Linux VM runners have Docker, but their runner
+    # accounts are not in the docker group, so this runs on GitHub-hosted Linux.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Job-level, so a comment the filter rejects (job skipped) never joins a group. Pushes and an
+    # exact /review share the PR's review group, so a new push cancels the older review; /ask and
+    # /improve use their own group, so they can't cancel a running review.
+    concurrency:
+      group: ${{ format('pr-agent-{0}-{1}', github.event.pull_request.number || github.event.issue.number, (github.event_name == 'pull_request' || contains(fromJSON('["/review","/review ","/review\n","/review\r\n","/review\t"]'), github.event.comment.body)) && 'review' || 'cmd') }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check for the secrets and capture the PR head
+        id: gate
+        env:
+          HAS_KEY: ${{ secrets.OPENROUTER_KEY != '' }}
+          HAS_SETTINGS_KEY: ${{ secrets.PR_AGENT_SETTINGS_KEY != '' }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMENT: ${{ github.event.comment.body }}
+        run: |
+          if [ "$HAS_KEY" != "true" ] || [ "$HAS_SETTINGS_KEY" != "true" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=PR-Agent skipped::Set the OPENROUTER_KEY and PR_AGENT_SETTINGS_KEY secrets (Settings > Secrets and variables > Actions) for PR-Agent to run."
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          # The review must be updated after this moment to count as a review of this run.
+          echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # Score only pull_request events and an exact /review comment, against the head
+          # captured here, before PR-Agent runs. /improve and /ask never touch the scorecard.
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "score=true" >> "$GITHUB_OUTPUT"
+            echo "head=$PR_HEAD" >> "$GITHUB_OUTPUT"
+          elif [ "$(printf '%s' "$COMMENT" | tr -d '[:space:]')" = "/review" ]; then
+            echo "score=true" >> "$GITHUB_OUTPUT"
+            echo "head=$(gh api "repos/$REPO/pulls/$ISSUE_NUMBER" --jq .head.sha)" >> "$GITHUB_OUTPUT"
+          else
+            echo "score=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fetch the shared review rules
+        if: steps.gate.outputs.ready == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: blazeluminati/pr-agent-settings
+          # Every repo follows main, so one merge there updates them all.
+          ref: main
+          path: .pr-agent-shared
+          ssh-key: ${{ secrets.PR_AGENT_SETTINGS_KEY }}
+          persist-credentials: false
+      - name: PR-Agent
+        id: pragent
+        if: steps.gate.outputs.ready == 'true'
+        # Image pinned by digest; the action wrapper only adds a FROM on the rolling
+        # :github_action tag, so pinning its commit would not pin what runs.
+        # Digest attestation verified with: gh attestation verify --repo The-PR-Agent/pr-agent
+        uses: docker://pragent/pr-agent@sha256:548e894a88071180832b2f4233f734d0acd0db1a879e2fcbaa70bac8b8372ebe # v0.50.0-github_action (action commit e673a02076ce09a4726c3d0c3cc85780e59ca52b)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER__KEY: ${{ secrets.OPENROUTER_KEY }}
+          # Log as it happens, so a slow model call shows in the job log.
+          PYTHONUNBUFFERED: "1"
+          # All review rules: model, limits, triggers, instructions. The repo's own
+          # .pr_agent.toml (default branch) is applied after this and can override it.
+          config.extra_config_url: /github/workspace/.pr-agent-shared/pr_agent.toml
+      - name: Scorecard
+        # Runs when PR-Agent or the settings fetch fails too, so a failed review replaces the old
+        # scorecard with key_issues=-1 instead of leaving an earlier verdict in place.
+        if: ${{ !cancelled() && steps.gate.outputs.ready == 'true' && steps.gate.outputs.score == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          REVIEW_OUTCOME: ${{ steps.pragent.outcome }}
+          HEAD_SHA: ${{ steps.gate.outputs.head }}
+          RUN_STARTED: ${{ steps.gate.outputs.started }}
+        run: |
+          if [ -f .pr-agent-shared/scorecard.py ]; then
+            exec python3 -I .pr-agent-shared/scorecard.py
+          fi
+          # The shared settings could not be fetched: post a failed scorecard, and fail the step.
+          python3 -I - <<'PY'
+          import json, os, subprocess
+          def gh(*args, data=None):
+              return subprocess.run(["gh", "api", *args], input=data, capture_output=True, text=True, check=True).stdout
+          repo, pr = os.environ["REPO"], os.environ["PR_NUMBER"]
+          head = os.environ.get("HEAD_SHA") or json.loads(gh(f"repos/{repo}/pulls/{pr}"))["head"]["sha"]
+          pages = json.loads(gh("--paginate", "--slurp", f"repos/{repo}/issues/{pr}/comments"))
+          mine = [c for page in pages for c in page
+                  if c["user"]["login"] == "github-actions[bot]" and c["body"].startswith("<!-- pr-agent:scorecard -->")]
+          body = ("<!-- pr-agent:scorecard -->\n"
+                  f"<!-- key_issues=-1 overall=0 status=failed head={head} -->\n"
+                  "## PR-Agent scorecard\n\n"
+                  f"**⛔ Not scored on {head[:7]}.** The shared settings couldn't be loaded from "
+                  "blazeluminati/pr-agent-settings, so this PR is not scored as clean.\n")
+          payload = json.dumps({"body": body})
+          if mine:
+              gh("-X", "PATCH", f"repos/{repo}/issues/comments/{mine[0]['id']}", "--input", "-", data=payload)
+          else:
+              gh("-X", "POST", f"repos/{repo}/issues/{pr}/comments", "--input", "-", data=payload)
+          PY
+          exit 1
