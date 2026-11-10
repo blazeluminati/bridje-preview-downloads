@@ -80,7 +80,6 @@ jobs:
         with:
           repository: blazeluminati/pr-agent-settings
           # Every repo follows main, so one merge there updates them all.
-          # BLA 237: reads the settings PR branch until pr-agent-settings PR 1 merges. Set to main then.
           ref: main
           path: .pr-agent-shared
           ssh-key: ${{ secrets.PR_AGENT_SETTINGS_KEY }}
