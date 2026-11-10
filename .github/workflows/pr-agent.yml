@@ -14,8 +14,9 @@ jobs:
   pr_agent:
     name: pr-agent
     # Same-repository PRs only (fork PRs get no secrets). On comments, only the exact commands
-    # /review and /improve (no arguments; a trailing space or newline is allowed) and "/ask <question>",
-    # on a PR, from owners, members and collaborators. /describe and arguments are not allowed.
+    # /review and /improve (no arguments; a trailing space or newline is allowed) and "/ask <question>"
+    # without PR-Agent options (" --"), on a PR, from owners, members and collaborators. /describe and
+    # arguments are not allowed.
     # Never a bot (no feedback loops).
     if: >-
       github.event.sender.type != 'Bot' &&
@@ -25,16 +26,17 @@ jobs:
         github.event.issue.pull_request &&
         (contains(fromJSON('["/review","/review ","/review\n","/review\r\n","/review\t"]'), github.event.comment.body) ||
          contains(fromJSON('["/improve","/improve ","/improve\n","/improve\r\n","/improve\t"]'), github.event.comment.body) ||
-         ((startsWith(github.event.comment.body, '/ask ') || startsWith(github.event.comment.body, fromJSON('"/ask\n"')) || startsWith(github.event.comment.body, fromJSON('"/ask\r"')) || startsWith(github.event.comment.body, fromJSON('"/ask\t"'))) && !contains(fromJSON('["/ask ","/ask\n","/ask\r\n","/ask\t"]'), github.event.comment.body))) &&
+         ((startsWith(github.event.comment.body, '/ask ') || startsWith(github.event.comment.body, fromJSON('"/ask\n"')) || startsWith(github.event.comment.body, fromJSON('"/ask\r"')) || startsWith(github.event.comment.body, fromJSON('"/ask\t"'))) && !contains(fromJSON('["/ask ","/ask\n","/ask\r\n","/ask\t"]'), github.event.comment.body) && !contains(github.event.comment.body, ' --') && !contains(github.event.comment.body, fromJSON('"\n--"')))) &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
     # The action is a Docker image. The Studio Linux VM runners have Docker, but their runner
     # accounts are not in the docker group, so this runs on GitHub-hosted Linux.
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Job-level, so a comment the filter rejects (job skipped) never joins the group and can't
-    # cancel a running review; a new push on the same PR still cancels the older run.
+    # Job-level, so a comment the filter rejects (job skipped) never joins a group. Pushes and an
+    # exact /review share the PR's review group, so a new push cancels the older review; /ask and
+    # /improve use their own group, so they can't cancel a running review.
     concurrency:
-      group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: ${{ format('pr-agent-{0}-{1}', github.event.pull_request.number || github.event.issue.number, (github.event_name == 'pull_request' || contains(fromJSON('["/review","/review ","/review\n","/review\r\n","/review\t"]'), github.event.comment.body)) && 'review' || 'cmd') }}
       cancel-in-progress: true
     permissions:
       contents: read
